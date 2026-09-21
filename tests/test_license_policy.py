@@ -458,6 +458,140 @@ def test_invalid_spdx_not_evaluated_when_lock_invalid_is_409():
     assert r.status_code == 409
 
 
+def test_invalid_spdx_takes_priority_over_shared_path_budget_422():
+    """回归：前序命中包耗尽共享 1000 条路径额度时，后续包的非法 SPDX
+    表达式仍必须返回 422，而不是被路径预算抢先返回 409 status=limit。
+
+    构造：app 经 999 个中间包汇聚到 sink-a（拒绝，恰 999 条路径），再
+    汇聚到 sink-b（拒绝），二者合计 1998 > 1000；另有 z-bad（名字排在
+    sink-* 之后）携带非法表达式。旧实现按包名逐项“判定+查路径”，处理
+    sink-a 后额度耗尽，sink-b 立即抛 409，z-bad 的非法表达式根本未被
+    检查；修复后先完成全部可达包的 SPDX 解析，稳定返回 422。
+    """
+    deps = [d(f"w{i}") for i in range(999)] + [d("z-bad")]
+    repo = {"app": [c("1.0", deps)]}
+    lock = {"app": "1.0", "z-bad": "1.0"}
+    for i in range(999):
+        repo[f"w{i}"] = [c("1.0", [d("sink-a"), d("sink-b")])]
+        lock[f"w{i}"] = "1.0"
+    repo["sink-a"] = [c("1.0", license_="GPL-3.0-only")]
+    repo["sink-b"] = [c("1.0", license_="AGPL-3.0-only")]
+    repo["z-bad"] = [c("1.0", license_="MIT AND")]
+    lock["sink-a"] = "1.0"
+    lock["sink-b"] = "1.0"
+
+    def post(repo_, lock_):
+        return policy(repo_, lock_)
+
+    r = post(repo, lock)
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["status"] == "invalid_snapshot"
+    assert "z-bad==1.0" in body["message"]
+    assert "SPDX" in body["message"]
+    assert "violations" not in body and "unknowns" not in body
+
+    # 与输入顺序无关：仓库键与锁键逆序提交，422 响应逐字节一致。
+    r_reversed = post(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(lock.items()))),
+    )
+    assert r_reversed.status_code == 422
+    assert r_reversed.json() == body
+
+    # 对照：把非法表达式换成合法且允许的 MIT（不产生路径条目），则保留
+    # 既有共享额度语义——sink-a 计 999 后加入 sink-b 超限：409 limit。
+    repo_fixed = dict(repo)
+    repo_fixed["z-bad"] = [c("1.0", license_="MIT")]
+    r_limit = post(repo_fixed, lock)
+    assert r_limit.status_code == 409, r_limit.text
+    limit_body = r_limit.json()
+    assert limit_body["status"] == "limit"
+    assert limit_body["target"] == "sink-b"
+    assert limit_body["used"] == 1001
+    assert limit_body["limit"] == 1000
+    assert "violations" not in limit_body and "unknowns" not in limit_body
+
+
+def test_invalid_spdx_after_single_target_over_budget_still_422():
+    """非法表达式所在包名字排在一个自身即超 1000 条路径的命中包之后，
+    仍稳定 422（而非 409）：10 层分层菱形 sink（1024 条最短路径，拒绝）
+    名字在前，zzz-bad 在后携带非法表达式。
+    """
+    layers = 10
+    repo = {"app": [c("1.0", [d("l1a"), d("l1b")], license_="MIT")]}
+    lock = {"app": "1.0"}
+    for i in range(1, layers + 1):
+        for s_ in ("a", "b"):
+            node = f"l{i}{s_}"
+            node_deps = (
+                [d(f"l{i + 1}a"), d(f"l{i + 1}b")]
+                if i < layers else [d("sink"), d("zzz-bad")]
+            )
+            repo[node] = [c("1.0", node_deps, license_="MIT")]
+            lock[node] = "1.0"
+    repo["sink"] = [c("1.0", license_="GPL-3.0-only")]
+    repo["zzz-bad"] = [c("1.0", license_="(MIT)AND(Apache-2.0)")]
+    lock["sink"] = "1.0"
+    lock["zzz-bad"] = "1.0"
+
+    r = policy(repo, lock)
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["status"] == "invalid_snapshot"
+    assert "zzz-bad==1.0" in body["message"]
+    # 重排输入后逐字节一致。
+    r2 = policy(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(lock.items()))),
+    )
+    assert r2.status_code == 422
+    assert r2.json() == body
+
+
+def test_invalid_spdx_on_otherwise_allowed_package_still_422():
+    """即使表达式若合法会判定为允许（不出现在结果、无需路径），非法文本
+    仍在判定阶段稳定返回 422，且优先于其他命中包造成的路径额度 409。
+    """
+    # sink 自身 1001 条路径（拒绝）-> 全合法时必 409；z-bad 表达式非法，
+    # 且该表达式本应 allow（MIT OR GPL），但语法错误优先报 422。
+    deps = [d(f"w{i}") for i in range(1001)] + [d("z-bad")]
+    repo = {"app": [c("1.0", deps, license_="MIT")]}
+    lock = {"app": "1.0", "z-bad": "1.0"}
+    for i in range(1001):
+        repo[f"w{i}"] = [c("1.0", [d("sink")], license_="MIT")]
+        lock[f"w{i}"] = "1.0"
+    repo["sink"] = [c("1.0", license_="GPL-3.0-only")]
+    repo["z-bad"] = [c("1.0", license_="MIT OR GPL-3.0-only)")]
+    lock["sink"] = "1.0"
+
+    r = policy(repo, lock)
+    assert r.status_code == 422, r.text
+    assert "z-bad==1.0" in r.json()["message"]
+
+
+def test_multiple_invalid_expressions_first_in_name_order_reported():
+    """多个包的表达式都非法时，按包名顺序稳定报告首个非法包，与输入
+    （依赖声明、仓库键、锁键）顺序无关。
+    """
+    repo = {
+        "app": [c("1.0", [d("z-b"), d("a-bad")], license_="MIT")],
+        "z-b": [c("1.0", license_="MIT AND")],
+        "a-bad": [c("1.0", license_="OR MIT")],
+    }
+    lock = {"app": "1.0", "z-b": "1.0", "a-bad": "1.0"}
+    r1 = policy(repo, lock)
+    assert r1.status_code == 422
+    assert "a-bad==1.0" in r1.json()["message"]
+    assert "z-b" not in r1.json()["message"]
+    r2 = policy(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(lock.items()))),
+    )
+    assert r2.status_code == 422
+    assert r2.json() == r1.json()
+
+
 def test_bad_snapshot_422():
     r = policy({"app": [c("oops")]}, {"app": "1.0"})
     assert r.status_code == 422

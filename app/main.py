@@ -41,13 +41,13 @@
   缺失元数据只形成 warnings，不阻断导出；结果按包名排序
 * POST /license-policy
   先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
-  有效则解析各可达包锁定版本 metadata.license 的 SPDX AND/OR/括号
-  表达式，按请求的 allow/deny 标识集合做三态判定，返回按包名排序的
-  violations 与 unknowns（各附根包到该包的全部最短路径）；一次请求
-  所有命中包的路径条数**共享请求级预算 1000**（按包名顺序累计，加入
-  下一目标超限即整体返回 409 status=limit，used 恒为 1001，不返回
-  部分结果；恰好累计 1000 成功）；
-  非法 SPDX 表达式或 allow/deny 规则重叠返回 422
+  有效则先对所有可达包锁定版本 metadata.license 的 SPDX AND/OR/括号
+  表达式完成解析与三态判定（任一非法即 422，该阶段不查询路径，故 422
+  稳定优先于路径额度的 409、与包名及输入顺序无关），全部合法后返回按
+  包名排序的 violations 与 unknowns（各附根包到该包的全部最短路径）；
+  一次请求所有命中包的路径条数**共享请求级预算 1000**（按包名顺序累计，
+  加入下一目标超限即整体返回 409 status=limit，used 恒为 1001，不返回
+  部分结果；恰好累计 1000 成功）；allow/deny 规则重叠同样返回 422
 * POST /lock-diff
   同一份仓库快照与目标环境下提交 before_lock、after_lock 两份锁定清单：
   各自独立复用 /audit-lock 规则校验，任一无效即整体 409 并分别标注
@@ -983,9 +983,11 @@ def sbom_endpoint(request: SbomRequest):
             "model": InvalidLockResponse | PathLimitResponse,
             "description": (
                 "锁定清单未通过审计（status=invalid_lock）；"
-                "或一次请求所有命中包的最短路径条数累计超过请求级共享预算"
-                "（status=limit，按包名顺序加入下一目标即超限，used 恒为"
-                "1001，不返回部分结果、未构造路径列表）"
+                "或所有可达包的 SPDX 表达式均合法后，命中包的最短路径条数"
+                "累计超过请求级共享预算（status=limit，按包名顺序加入下一"
+                "目标即超限，used 恒为 1001，不返回部分结果、未构造路径"
+                "列表）。任一可达包表达式非法时先返回 422，不进入路径累计"
+                "阶段，故不会被本 409 抢先"
             ),
         },
         422: {
@@ -1038,10 +1040,13 @@ def license_policy_endpoint(request: LicensePolicyRequest):
         )
 
     # 规则集合（标识合法性、allow/deny 重叠）与许可证表达式均属于请求
-    # 语义校验：非法返回 422，输出不做任何判定。一次请求所有命中包的
-    # 最短路径条数共享请求级预算（1000 条）：判定按包名顺序逐包进行，
-    # 加入下一目标会使累计超限即整体 409（status=limit，target 指向该
-    # 目标、used 恒为 1001），不构造任何路径列表、不返回部分结果。
+    # 语义校验：非法返回 422，输出不做任何判定。判定分两个先后阶段：先
+    # 对所有可达包完成 SPDX 解析与三态判定（不触碰路径预算），任一表达式
+    # 非法稳定返回 422——即使名字靠前的命中包本会耗尽共享路径额度，422
+    # 也优先于 409；全部合法后才按包名顺序逐个查询最短路径，一次请求所有
+    # 命中包的路径条数共享请求级预算（1000 条），加入下一目标会使累计
+    # 超限即整体 409（status=limit，target 指向该目标、used 恒为 1001），
+    # 不构造任何路径列表、不返回部分结果。
     try:
         allow_set, deny_set = parse_policy_sets(request.allow, request.deny)
         graph = build_locked_graph(

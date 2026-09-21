@@ -26,6 +26,13 @@ extraneous）。因此与 :mod:`app.sbom` 一样，这里不做任何版本选�
 该目标、``used`` 恒为 1001、``limit`` 为 1000），由路由层映射为
 409 ``status=limit``，不构造任何路径列表、不返回部分业务结果；恰好
 累计到 1000 仍成功返回。
+
+**错误响应优先级**：判定分两个阶段——先对**全部**可达包完成 SPDX
+解析与三态判定（任一表达式非法即抛 LicenseExpressionError，路由层
+映射为 422），再按包名顺序为 violations/unknowns 计算最短路径（此时
+才可能抛 PathCountLimit）。因此只要任一可达包的表达式非法，响应稳定
+为 422，不会因为排在前面的命中包先耗尽共享路径预算而错误返回 409
+``status=limit``；该优先级与包名、仓库键 / 锁键的输入顺序无关。
 """
 
 from __future__ import annotations
@@ -59,18 +66,25 @@ def evaluate_license_policy(
 
     ``graph`` 为 :func:`app.paths.build_locked_graph` 产出的根可达子图
     （节点集恰为锁中全部包）。返回
-    ``{"violations": [...], "unknowns": [...]}``，两项均按包名排序；
-    包的 SPDX 表达式非法时抛 LicenseExpressionError（定位到包与版本）。
-    命中包按包名顺序逐个查询最短路径，各目标的路径条数累计到同一个
-    请求级 :class:`~app.paths.PathCountBudget`（上限 1000，violations
-    与 unknowns 合在一起累计）：加入下一目标会使累计超限即抛
-    :exc:`app.paths.PathCountLimit`（首个超限目标、``used`` 恒为 1001），
-    不构造路径列表、不返回部分结果。
-    """
-    violations: list[dict] = []
-    unknowns: list[dict] = []
-    budget = PathCountBudget()
+    ``{"violations": [...], "unknowns": [...]}``，两项均按包名排序。
 
+    分两个阶段，保证错误响应优先级确定：
+
+    1. **先对全部可达包完成 SPDX 解析与三态判定**（不做任何路径查询）：
+       任一包的表达式非法即抛 LicenseExpressionError（定位到包与版本，
+       API 层映射为 422）——即使按包名排在前面的命中包本会在路径阶段
+       耗尽共享预算，也稳定返回 422 而非 409 ``status=limit``，与包名、
+       仓库键 / 锁键的输入顺序无关；
+    2. **全部表达式合法后才计算路径**：命中包（violations 与 unknowns
+       合在一起）按包名顺序逐个查询最短路径，各目标的路径条数累计到同
+       一个请求级 :class:`~app.paths.PathCountBudget`（上限 1000）：
+       加入下一目标会使累计超限即抛 :exc:`app.paths.PathCountLimit`
+       （首个超限目标、``used`` 恒为 1001），不构造路径列表、不返回
+       部分结果；恰好累计到 1000 仍成功。
+    """
+    # 阶段一：逐包解析 SPDX 并完成三态判定。此阶段不触碰路径预算，
+    # 任一非法表达式都在此抛出（422），先于任何 409 status=limit。
+    decisions: list[tuple[str, int, str | None]] = []  # (包名, 判定, 许可证文本)
     for name in sorted(graph):
         locked = current_lock[name]
         cand = _find_candidate(repo, name, locked)  # 有效锁：锁定版本必在快照
@@ -87,7 +101,15 @@ def evaluate_license_policy(
                     f" 不是合法的 SPDX 表达式: {exc}"
                 ) from exc
             decision = evaluate_spdx_expression(node, allow, deny)
+        decisions.append((name, decision, license_text))
 
+    # 阶段二：全部表达式合法后，才按同一包名顺序为命中包计算最短路径，
+    # 条数累计到共享预算（计费顺序与阶段一一致，超限语义不变）。
+    violations: list[dict] = []
+    unknowns: list[dict] = []
+    budget = PathCountBudget()
+
+    for name, decision, license_text in decisions:
         if decision == DENY:
             violations.append(_entry(name, graph, root_name, license_text, budget))
         elif decision == UNKNOWN:

@@ -41,12 +41,13 @@
   缺失元数据只形成 warnings，不阻断导出；结果按包名排序
 * POST /license-policy
   先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
-  有效则解析各可达包锁定版本 metadata.license 的 SPDX AND/OR/括号
-  表达式，按请求的 allow/deny 标识集合做三态判定，返回按包名排序的
-  violations 与 unknowns（各附根包到该包的全部最短路径）；一次请求
-  所有命中包的路径条数**共享请求级预算 1000**（按包名顺序累计，加入
-  下一目标超限即整体返回 409 status=limit，used 恒为 1001，不返回
-  部分结果；恰好累计 1000 成功）；
+  有效则先对全部可达包完成 SPDX AND/OR/括号表达式解析与 allow/deny
+  三态判定（任一表达式非法即 422，优先于路径预算 409，与包名、输入
+  顺序无关），全部合法后才按包名顺序为命中包计算最短路径，返回按
+  包名排序的 violations 与 unknowns（各附根包到该包的全部最短路径）；
+  一次请求所有命中包的路径条数**共享请求级预算 1000**（按包名顺序
+  累计，加入下一目标超限即整体返回 409 status=limit，used 恒为
+  1001，不返回部分结果；恰好累计 1000 成功）；
   非法 SPDX 表达式或 allow/deny 规则重叠返回 422
 * POST /lock-diff
   同一份仓库快照与目标环境下提交 before_lock、after_lock 两份锁定清单：
@@ -1038,10 +1039,12 @@ def license_policy_endpoint(request: LicensePolicyRequest):
         )
 
     # 规则集合（标识合法性、allow/deny 重叠）与许可证表达式均属于请求
-    # 语义校验：非法返回 422，输出不做任何判定。一次请求所有命中包的
-    # 最短路径条数共享请求级预算（1000 条）：判定按包名顺序逐包进行，
-    # 加入下一目标会使累计超限即整体 409（status=limit，target 指向该
-    # 目标、used 恒为 1001），不构造任何路径列表、不返回部分结果。
+    # 语义校验：非法返回 422，输出不做任何判定。判定分两个阶段：先对全部
+    # 可达包完成 SPDX 解析与三态判定（任一表达式非法即 422，优先于路径
+    # 预算 409，与包名、输入顺序无关），全部合法后才按包名顺序为命中包
+    # 计算最短路径——一次请求所有命中包的路径条数共享请求级预算（1000
+    # 条）：加入下一目标会使累计超限即整体 409（status=limit，target
+    # 指向该目标、used 恒为 1001），不构造任何路径列表、不返回部分结果。
     try:
         allow_set, deny_set = parse_policy_sets(request.allow, request.deny)
         graph = build_locked_graph(

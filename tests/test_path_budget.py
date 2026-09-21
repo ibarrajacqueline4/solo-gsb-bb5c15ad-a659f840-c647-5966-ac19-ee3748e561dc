@@ -15,6 +15,13 @@ BFS 建立最短前驱图，先按层做饱和计数：条数超过固定预算 
 返回部分业务结果；恰好累计到 1000 的目标仍成功。/dependency-paths 为
 单目标查询，预算每请求独立，单目标边界（1001 条失败）与恰好 1000 条
 成功的行为保持不变。
+
+/license-policy 的错误响应优先级：先对全部可达包完成 SPDX 解析与三态
+判定，再按包名顺序为命中包计算路径。因此任一表达式非法时**稳定返回
+422**——即使按包名排在前面的命中包本会耗尽共享预算（旧实现会错误
+返回 409 status=limit），也不受包名、仓库键 / 锁键输入顺序影响；全部
+表达式合法时，共享预算、首个超限 target、used=1001、恰好 1000 成功与
+不返回部分结果的语义完全保留。
 """
 
 from __future__ import annotations
@@ -678,4 +685,104 @@ def test_policy_huge_second_target_saturates_under_partial_budget():
     assert body["target"] == "sink-b"  # sink-a 先计 999，sink-b 无剩余额度
     assert body["used"] == 1001
     assert body["limit"] == 1000
+
+
+# --------------------------------------------------------------------- #
+# 6. 错误优先级：非法 SPDX 表达式（422）优先于共享路径预算（409 limit）
+# --------------------------------------------------------------------- #
+def _diamond_denied_plus_invalid(invalid_name="zzz-bad", invalid_license="MIT AND"):
+    """10 层菱形汇聚到 denied（GPL 违规，1024 条最短路径 > 1000），另挂一个
+    携带非法 SPDX 表达式的包（默认包名 zzz-bad 排在 denied 之后：旧实现按
+    包名逐包判定并立即计费，会在 denied 处耗尽预算返回 409，永远检查不到
+    后面的非法表达式）。
+    """
+    repo, lock = layered_repo_lock(
+        10, ["denied"], sink_metadata={"denied": {"license": "GPL-3.0-only"}}
+    )
+    repo["app"][0]["dependencies"].append(d(invalid_name))
+    repo[invalid_name] = [c("1.0", license=invalid_license)]
+    lock[invalid_name] = "1.0"
+    return repo, lock
+
+
+def test_invalid_spdx_after_budget_exhausting_hit_returns_422_not_limit():
+    """前序命中包耗尽共享预算时，后续包的非法表达式仍稳定返回 422。"""
+    repo, lock = _diamond_denied_plus_invalid()
+    r = query_policy(repo, lock)
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["status"] == "invalid_snapshot"
+    assert "zzz-bad==1.0" in body["message"]
+    assert "SPDX" in body["message"]
+    # 不返回任何业务结果，也不是 409 limit 形态。
+    assert "violations" not in body and "unknowns" not in body
+    assert "target" not in body and "used" not in body
+
+
+def test_invalid_spdx_fixture_without_invalid_package_still_409_limit():
+    """对照：同一夹具去掉非法表达式包，预算冲突本身仍返回 409 limit。"""
+    repo, lock = layered_repo_lock(
+        10, ["denied"], sink_metadata={"denied": {"license": "GPL-3.0-only"}}
+    )
+    r = query_policy(repo, lock)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["status"] == "limit"
+    assert body["target"] == "denied"
+    assert body["used"] == 1001
+    assert body["limit"] == 1000
+
+
+def test_invalid_spdx_before_budget_hit_also_422():
+    """非法表达式包名排在预算消耗者之前时同样 422（与包名无关）。"""
+    repo, lock = _diamond_denied_plus_invalid("aaa-bad", "MIT OR(Apache-2.0)")
+    r = query_policy(repo, lock)
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["status"] == "invalid_snapshot"
+    assert "aaa-bad==1.0" in body["message"]
+
+
+def test_invalid_spdx_over_budget_deterministic_across_input_reorder():
+    """冲突场景下输入重排（仓库键 / 锁键顺序）：422 响应逐字节一致。"""
+    repo, lock = _diamond_denied_plus_invalid()
+    r1 = query_policy(repo, lock)
+    r2 = query_policy(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(lock.items()))),
+    )
+    assert r1.status_code == r2.status_code == 422
+    assert r1.json() == r2.json()
+
+
+def test_multiple_invalid_spdx_reports_first_by_name_order():
+    """多个非法表达式与预算冲突并存：422 定位按包名排序的首个非法包。"""
+    repo, lock = _diamond_denied_plus_invalid("zzz-bad-1", "MIT AND")
+    repo["app"][0]["dependencies"].append(d("zzz-bad-2"))
+    repo["zzz-bad-2"] = [c("1.0", license="OR MIT")]
+    lock["zzz-bad-2"] = "1.0"
+    r = query_policy(repo, lock)
+    assert r.status_code == 422, r.text
+    message = r.json()["message"]
+    assert "zzz-bad-1==1.0" in message
+    assert "zzz-bad-2" not in message
+    # 输入重排不改变定位结果。
+    r2 = query_policy(
+        dict(reversed(list(repo.items()))),
+        dict(reversed(list(lock.items()))),
+    )
+    assert r2.json() == r.json()
+
+
+def test_invalid_spdx_after_unknown_hit_budget_exhaustion_returns_422():
+    """unknown 命中（未提供许可证）耗尽预算时，后续非法表达式同样 422。"""
+    repo, lock = layered_repo_lock(10, ["mystery"], sink_metadata={"mystery": {}})
+    repo["app"][0]["dependencies"].append(d("zzz-bad"))
+    repo["zzz-bad"] = [c("1.0", license="(MIT)AND(Apache-2.0)")]
+    lock["zzz-bad"] = "1.0"
+    r = query_policy(repo, lock)
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["status"] == "invalid_snapshot"
+    assert "zzz-bad==1.0" in body["message"]
 

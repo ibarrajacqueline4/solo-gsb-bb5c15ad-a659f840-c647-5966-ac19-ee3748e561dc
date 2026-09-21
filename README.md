@@ -25,9 +25,11 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 **确定性 JSON 物料清单（SBOM）**：每个包给出规范化名称、版本、PURL
 （Package URL）、依赖名称及候选版本随快照携带的 `source_url` / `sha256`
 / `license` 元数据；元数据缺失只形成 `warnings`，不阻断导出。
-`/license-policy` 也**先审计 `current_lock`**，锁有效时解析各可达包锁定
-版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**，按请求的
-`allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
+`/license-policy` 也**先审计 `current_lock`**，锁有效时先对**全部**可达包
+完成锁定版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**解析与
+`allow` / `deny` 标识集合**三态判定**（允许 / 拒绝 / 未知）——任一表达式
+非法即稳定返回 422（优先于路径预算 409，与包名、输入顺序无关）——全部
+合法后才按包名顺序为命中包计算最短路径，返回按包名
 排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
 一次请求所有命中包的最短路径**共享请求级条数预算 1000**（按包名顺序
 累计，加入下一目标即超限）时整体返回
@@ -1292,6 +1294,11 @@ curl -s -X POST http://localhost:8000/sbom \
    `MIT OR GPL-3.0-only`（MIT 在 allow 中）→ 允许；
    `MIT AND Custom-Internal`（`Custom-Internal` 两集合都没有）→ 未知；
    `GPL-3.0-only OR Custom-Internal`（一拒绝一未知）→ 未知。
+4. **全部可达包的表达式都完成解析与判定后**，才按包名顺序为
+   violations/unknowns 中的命中包计算最短路径（共享请求级预算，见响应
+   字段表）。因此**任一表达式非法时稳定返回 422**：即使按包名排在前面的
+   命中包本会在路径阶段耗尽共享预算，也不会错误返回 409
+   `status:"limit"`——该优先级与包名、仓库键 / 锁键的输入顺序无关。
 
 响应字段：
 
@@ -1377,7 +1384,7 @@ curl -s -X POST http://localhost:8000/license-policy \
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 锁有效，策略判定完成（存在违规或未知项仍是 200；`violations` / `unknowns` 同时为空表示全部允许） |
-| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定；或一次请求所有命中包的最短路径条数累计超过请求级共享预算 1000：`status: "limit"`，含 `target`（加入后会使累计超限的那个包）/ `used`（固定 1001）/ `limit`，不构造路径列表、不返回部分业务结果 |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定；或一次请求所有命中包的最短路径条数累计超过请求级共享预算 1000：`status: "limit"`，含 `target`（加入后会使累计超限的那个包）/ `used`（固定 1001）/ `limit`，不构造路径列表、不返回部分业务结果（路径计算在全部表达式判定完成后才开始，故非法 SPDX 表达式永远优先返回 422，不会与本项冲突） |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`、`AND`/`OR` 任一侧缺少空白分隔，如 `MIT OR(Apache-2.0)`、`(MIT)AND(Apache-2.0)`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
 ### `POST /lock-diff`
